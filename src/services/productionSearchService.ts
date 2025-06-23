@@ -1,46 +1,131 @@
 // Production 級真實搜索服務 - 使用用戶提供的 API 端點
 import { SearchQuery, SearchResult, SearchSource } from './realSearchService';
 
+// Helper interface for structured LLM response for sources
+interface LLMSourceSuggestion {
+  searchQueries?: string[];
+  urls?: string[];
+}
+
 class ProductionSearchService {
   private readonly API_ENDPOINT = "https://aiquiz.ycm927.workers.dev";
   private readonly MODEL_FALLBACK_LIST = [
-    "google/gemini-2.0-flash-exp:free", 
-    "deepseek/deepseek-r1-0528:free", 
+    "google/gemini-2.0-flash-exp:free",
+    "deepseek/deepseek-r1-0528:free",
     "google/gemini-2.5-flash-preview-05-20"
   ];
+
+  // 新增方法：從LLM獲取潛在的搜索查詢或URL
+  private async getPotentialSourcesFromLLM(originalQuery: string, language: string): Promise<LLMSourceSuggestion> {
+    const prompt = `Based on the user query "${originalQuery}" (language: ${language}), suggest 3-5 relevant web search queries OR direct URLs to find the most up-to-date and accurate information.
+Return your answer ONLY as a JSON object with one or both of the following keys: "searchQueries" (a list of strings) or "urls" (a list of strings). For example:
+{
+  "searchQueries": ["latest AI developments in Hong Kong", "Hong Kong AI policy 2024"],
+  "urls": ["https://www.example.com/ai-news", "https://www.another-example.com/hk-ai-report"]
+}
+If suggesting search queries, ensure they are effective for use with a standard search engine.
+If suggesting URLs, ensure they are likely to contain relevant information.
+Provide ONLY the JSON object in your response.`;
+
+    // Try with the first model, can add fallback logic if needed
+    const modelToUse = this.MODEL_FALLBACK_LIST[0];
+    try {
+      const response = await this.callAPI(modelToUse, prompt);
+      // Attempt to parse the response as JSON
+      const jsonResponse = JSON.parse(response) as LLMSourceSuggestion;
+      if (jsonResponse.searchQueries || jsonResponse.urls) {
+        return {
+            searchQueries: jsonResponse.searchQueries?.slice(0, 5), // Limit to 5
+            urls: jsonResponse.urls?.slice(0, 5) // Limit to 5
+        };
+      }
+      console.warn("LLM source suggestion response was not in the expected format:", response);
+      return {};
+    } catch (error) {
+      console.error("Error getting potential sources from LLM:", error);
+      console.error("LLM response was:", error.response); // Log the problematic response if possible
+      return {}; // Return empty object on error
+    }
+  }
 
   // 執行真實搜索
   async performSearch(searchQuery: SearchQuery): Promise<SearchResult> {
     const startTime = Date.now();
-    
+    let fetchedWebContext: { url: string, content: string, title?: string }[] = [];
+    let actualSourcesForDisplay: SearchSource[] = [];
+
     try {
-      // 構建查詢提示詞
-      const prompt = this.buildRAGPrompt(searchQuery);
-      
-      // 嘗試多個模型進行搜索
+      // 1. 從LLM獲取潛在的搜索查詢或URL
+      const potentialSources = await this.getPotentialSourcesFromLLM(searchQuery.query, searchQuery.language);
+      console.log("Potential sources from LLM:", potentialSources);
+
+      // 2. Fetch content from URLs if any are provided
+      if (potentialSources.urls && potentialSources.urls.length > 0) {
+        const urlsToFetch = potentialSources.urls.slice(0, 3); // Limit to fetching first 3 URLs
+
+        for (const url of urlsToFetch) {
+          try {
+            console.log(`Fetching content from URL: ${url}`);
+            // @ts-ignore Tool is available globally in the worker
+            const siteContent = await view_text_website(url);
+
+            if (siteContent) {
+              const title = url; // Using URL as title for now
+              const contentSnippet = siteContent.substring(0, 1500); // Truncate for context
+              const displaySnippet = siteContent.substring(0, 200); // Shorter for display
+
+              fetchedWebContext.push({ url, content: contentSnippet, title });
+              actualSourcesForDisplay.push({
+                title: title,
+                url: url,
+                snippet: displaySnippet,
+                content: contentSnippet, // Store the truncated content
+                hostname: new URL(url).hostname.replace(/^www\./, '')
+              });
+            }
+          } catch (fetchError) {
+            console.warn(`Failed to fetch content from ${url}:`, fetchError);
+            // Optionally add a placeholder source indicating failure
+            actualSourcesForDisplay.push({
+              title: `Failed to load: ${url}`,
+              url: url,
+              snippet: `Could not retrieve content from this URL. ${fetchError.message || ''}`.substring(0,200),
+              content: '',
+              hostname: new URL(url).hostname.replace(/^www\./, '')
+            });
+          }
+        }
+      }
+      // TODO: Handle potentialSources.searchQueries (construct search URLs, fetch, parse results)
+
+      console.log("Fetched web context snippets:", fetchedWebContext.map(s => ({url: s.url, len: s.content.length })));
+
+      // 3. 構建查詢提示詞 (Augmented with fetched context)
+      const prompt = this.buildRAGPrompt(searchQuery, fetchedWebContext);
+
+      // 4. 嘗試多個模型進行搜索
       for (const model of this.MODEL_FALLBACK_LIST) {
         try {
           const result = await this.callAPI(model, prompt);
           if (result) {
             const searchTime = Date.now() - startTime;
-            return this.formatSearchResult(searchQuery.query, result, searchTime);
+            return this.formatSearchResult(searchQuery.query, result, searchTime, actualSourcesForDisplay);
           }
         } catch (error) {
           console.warn(`模型 ${model} 失敗，嘗試下一個:`, error);
           continue;
         }
       }
-      
+
       throw new Error('所有模型都失敗了');
-      
+
     } catch (error) {
       console.error('搜索處理錯誤:', error);
       const searchTime = Date.now() - startTime;
-      
       return {
         query: searchQuery.query,
-        sources: [],
-        answer: '抱歉，搜索服務暫時不可用。請稍後再試。',
+        sources: actualSourcesForDisplay, // Return any sources fetched before the error
+        answer: `抱歉，處理您的請求時發生錯誤。 ${error.message || ''}`.substring(0, 500),
         followUpQuestions: [],
         searchTime,
         hasResults: false
@@ -48,11 +133,20 @@ class ProductionSearchService {
     }
   }
 
-  // 構建 RAG 提示詞
-  private buildRAGPrompt(searchQuery: SearchQuery): string {
+  // 修改 buildRAGPrompt 以接受外部上下文
+  private buildRAGPrompt(searchQuery: SearchQuery, contextSnippets: { url: string, content: string, title?: string }[]): string {
     const { query, language, focus } = searchQuery;
     const currentDate = new Date().toISOString().split('T')[0];
-    
+
+    let contextText = "";
+    if (contextSnippets && contextSnippets.length > 0) {
+      contextText = "\n\n**Relevant Information from Web Search:**\n";
+      contextSnippets.forEach((snippet, index) => {
+        contextText += `\n[Source ${index + 1}: ${snippet.url} (${snippet.title || 'Untitled'})]\n${snippet.content}\n`;
+      });
+      contextText += "\nPlease synthesize an answer based on the above information and your general knowledge. Cite sources using [Source X] notation where appropriate.\n";
+    }
+
     // 智能檢測查詢語言（檢查實際查詢內容的語言）
     const detectedLanguage = this.detectQueryLanguage(query, language);
     
@@ -166,7 +260,7 @@ ${responseRequirement}
 
 現在開始回答：`;
 
-    return promptTemplate;
+    return contextText + promptTemplate;
   }
 
   // 智能檢測查詢語言
@@ -278,24 +372,28 @@ ${responseRequirement}
   }
 
   // 格式化搜索結果
-  private formatSearchResult(query: string, apiResponse: string, searchTime: number): SearchResult {
-    // 不提供假的來源 - 如果API沒有提供真實sources就返回空數組
-    const sources: SearchSource[] = [];
+  private formatSearchResult(query: string, apiResponse: string, searchTime: number, fetchedSources: SearchSource[]): SearchResult {
+    // 使用從網絡獲取的真實來源
+    const sources: SearchSource[] = fetchedSources.map(s => ({
+      title: s.title,
+      url: s.url,
+      snippet: s.snippet, // Snippet could be a summary of the content fetched
+      content: s.content, // Full content fetched, if available
+      hostname: new URL(s.url).hostname.replace(/^www\./, '')
+    }));
     
     // 生成相關問題
     const followUpQuestions = this.generateFollowUpQuestions(query, apiResponse);
 
     return {
       query,
-      sources,
+      sources, // Use the actual fetched sources
       answer: apiResponse,
       followUpQuestions,
       searchTime,
-      hasResults: true
+      hasResults: true // Assuming if we got an API response, it's a result
     };
   }
-
-
 
   // 生成相關問題
   private generateFollowUpQuestions(query: string, response: string): string[] {
